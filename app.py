@@ -1,5 +1,9 @@
+import os
 import io
+import json
+import hmac
 import base64
+import hashlib
 from datetime import datetime
 from flask import Flask, request, send_file, jsonify, render_template_string, abort
 from flask_cors import CORS
@@ -7,10 +11,18 @@ import qrcode
 import qrcode.image.svg as qrcode_svg
 
 app = Flask(__name__)
-# Autoriser les appels cross-origin vers l'API (utile depuis un site statique distant)
+
+# ───────────────────────── Config / ENV ─────────────────────────
+# LIVE par défaut
+FEDAPAY_ENV = os.getenv("FEDAPAY_ENV", "live").strip().lower()  # "live" | "sandbox"
+FEDAPAY_WEBHOOK_SECRET = os.getenv("FEDAPAY_WEBHOOK_SECRET", "wh_live_FroCduCVd9yCZ9qxP7QKZdmx").strip()  # fournie par le dashboard Webhooks
+EVENT_PRICE_XOF = int(os.getenv("EVENT_PRICE_XOF", "3000"))
+EVENT_CURRENCY = os.getenv("EVENT_CURRENCY", "XOF").upper()     # XOF en live
+
+# Autoriser CORS pour les endpoints API (utile si front statique sur autre domaine)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ---------- Utilitaires ----------
+# ───────────────────────── Utilitaires QR ─────────────────────────
 MAX_LEN = 280  # limite simple pour éviter les abus
 
 def build_payload(nom: str, prenom: str) -> str:
@@ -21,13 +33,15 @@ def build_payload(nom: str, prenom: str) -> str:
         abort(400, "Champs 'nom' et 'prenom' requis")
     if len(nom) > MAX_LEN or len(prenom) > MAX_LEN:
         abort(413, "Champs trop longs (max 280 caractères)")
-    # Tu peux changer le format si tu veux (vCard, texte libre, etc.)
-    return f'{{"nom":"{nom}","prenom":"{prenom}","ts":"{datetime.utcnow().isoformat()}Z"}}'
+    return json.dumps(
+        {"nom": nom, "prenom": prenom, "ts": datetime.utcnow().isoformat() + "Z"},
+        ensure_ascii=False
+    )
 
 def make_qr_png(data: str) -> bytes:
     """Génère un PNG en mémoire."""
     qr = qrcode.QRCode(
-        version=None,  # auto
+        version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_M,
         box_size=10,
         border=2,
@@ -47,7 +61,7 @@ def make_qr_svg(data: str) -> bytes:
     img.save(buf)
     return buf.getvalue()
 
-# ---------- Pages ----------
+# ───────────────────────── Pages de test ─────────────────────────
 INDEX = """
 <!doctype html>
 <html lang="fr">
@@ -85,14 +99,6 @@ INDEX = """
     <li>POST <code>/api/qr</code> → image (PNG par défaut, ou <code>?format=svg</code>)</li>
     <li>POST <code>/api/qr?response=json</code> → <code>{"data_url": "data:image/png;base64,..."}</code></li>
   </ul>
-  <p>Exemple site statique :</p>
-  <pre><code>fetch("https://&lt;ton-service&gt;.onrender.com/api/qr?response=json", {
-  method: "POST",
-  headers: {"Content-Type": "application/json"},
-  body: JSON.stringify({ nom: "Alice", prenom: "Dupont" })
-}).then(r =&gt; r.json()).then(({data_url}) =&gt; {
-  document.querySelector("img").src = data_url;
-});</code></pre>
   <script>
     const f = document.getElementById('f');
     const out = document.getElementById('out');
@@ -127,7 +133,7 @@ def preview_qr():
     png = make_qr_png(text)
     return send_file(io.BytesIO(png), mimetype="image/png", download_name="qr.png")
 
-# ---------- API ----------
+# ───────────────────────── API QR ─────────────────────────
 @app.post("/api/qr")
 def api_qr():
     """
@@ -162,47 +168,36 @@ def api_qr():
 def health():
     return {"status": "ok"}
 
-
-# --- WEBHOOK FedaPay (réception événements serveur->serveur) ---
-import os, hmac, hashlib, json
-from flask import request, jsonify, abort
-
-# Variables d'env (à créer sur Render)
-FEDAPAY_WEBHOOK_SECRET = os.getenv("FEDAPAY_WEBHOOK_SECRET", "wh_live_2rC8SS0fshX26r4Ejz3hhvC9")  # chaîne hex ou texte partagé
-EVENT_PRICE_XOF = int(os.getenv("EVENT_PRICE_XOF", "3000"))
-EVENT_CURRENCY = os.getenv("EVENT_CURRENCY", "XOF").upper()
-
+# ───────────────────────── Webhook FedaPay (LIVE) ─────────────────────────
+# IMPORTANT : FedaPay envoie la signature dans le header **X-FEDAPAY-SIGNATURE**
 def _verify_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
     """
-    Vérifie la signature HMAC-SHA256.
-    Par défaut on attend un header 'FedaPay-Signature' contenant l'hex du HMAC.
-    Si ton dashboard/documentation donne un autre nom/format, adapte ici.
+    Vérifie la signature HMAC-SHA256 du corps.
+    - signature_header : valeur du header 'X-FEDAPAY-SIGNATURE'
+    - secret : FEDAPAY_WEBHOOK_SECRET (dashboard Webhooks)
     """
-    if not secret:
-        # Si pas de secret défini, on accepte (utile pour tester vite fait) — à éviter en prod
-        return True
-    if not signature_header:
+    if not secret or not signature_header:
         return False
-    digest = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(digest, signature_header)
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
 
 @app.post("/webhook/fedapay")
 def webhook_fedapay():
     """
-    Webhook minimal :
-    - Vérifie (si présent) la signature HMAC dans 'FedaPay-Signature'
-    - Lit le JSON
-    - Si statut payé + montant/devise corrects => (ex) log / générer QR / marquer payé
-    NB: le webhook n'affiche rien à l'utilisateur; il doit répondre vite (200 OK).
+    Webhook minimal & fiable :
+    - Vérifie la signature HMAC (header 'X-FEDAPAY-SIGNATURE')
+    - Lit l’événement JSON
+    - Si transaction approuvée ET montant/devise OK -> log/traitement
+      (ici, tu peux déclencher la génération de QR + envoi email/DB)
     """
     raw = request.get_data()
-    signature = request.headers.get("FedaPay-Signature", "")
+    signature = request.headers.get("X-FEDAPAY-SIGNATURE", "")  # ✅ header correct
 
-    # 1) Signature
+    # 1) Signature obligatoire en prod
     if not _verify_signature(raw, signature, FEDAPAY_WEBHOOK_SECRET):
         abort(401, "Signature invalide")
 
-    # 2) JSON
+    # 2) Payload JSON
     payload = request.get_json(silent=True) or {}
     event = (payload.get("event") or "").lower()
     data = payload.get("data") or {}
@@ -210,27 +205,31 @@ def webhook_fedapay():
     status = (tx.get("status") or "").lower()
     amount = int(tx.get("amount") or 0)
 
-    # Devise peut être "XOF" ou un objet { iso:"XOF", ... }
+    # Devise : string "XOF" ou objet {"iso":"XOF", ...}
     cur = tx.get("currency")
     if isinstance(cur, dict):
         currency = (cur.get("iso") or cur.get("code") or "").upper()
     else:
         currency = (cur or "").upper()
 
-    app.logger.info(f"[Webhook] event={event} status={status} amount={amount} {currency}")
+    app.logger.info(f"[Webhook LIVE] event={event} status={status} amount={amount} {currency}")
 
-    # 3) Règle de validation minimaliste
-    if status in {"approved", "paid", "success", "completed"} and amount == EVENT_PRICE_XOF and currency in {"XOF", "CFA", "FCFA"}:
-        # Ici tu peux :
-        # - Générer le QR (si tu connais le nom/prénom côté serveur)
-        # - Ou marquer la transaction 'payée' en base
-        # - Ou déclencher un email/SMS, etc.
-        app.logger.info("[Webhook] ✅ Paiement validé — action de confirmation ici")
+    # 3) Validation basique
+    paid_ok = status in {"approved", "paid", "success", "completed"}
+    money_ok = (amount == EVENT_PRICE_XOF and currency in {"XOF", "CFA", "FCFA"})
 
-    # Toujours répondre 200 rapidement
+    if event == "transaction.approved" and paid_ok and money_ok:
+        # Ici tu peux : générer le QR et l'envoyer (email/SMS) ou marquer 'payé' en DB
+        # Exemple de récupération de nom/prénom si FedaPay te les renvoie :
+        # customer = tx.get("customer") or {}
+        # first_name = customer.get("first_name")
+        # last_name = customer.get("last_name")
+        app.logger.info("[Webhook LIVE] ✅ Paiement validé — déclencher ton traitement ici")
+
+    # Répondre vite en 200
     return jsonify({"ok": True})
-
+    
 
 if __name__ == "__main__":
-    print("==> QR Provider sur http://127.0.0.1:5000 (Ctrl+C pour arrêter)")
+    print("==> QR Provider LIVE sur http://127.0.0.1:5000 (Ctrl+C pour arrêter)")
     app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
