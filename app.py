@@ -162,6 +162,75 @@ def api_qr():
 def health():
     return {"status": "ok"}
 
+
+# --- WEBHOOK FedaPay (réception événements serveur->serveur) ---
+import os, hmac, hashlib, json
+from flask import request, jsonify, abort
+
+# Variables d'env (à créer sur Render)
+FEDAPAY_WEBHOOK_SECRET = os.getenv("FEDAPAY_WEBHOOK_SECRET", "")  # chaîne hex ou texte partagé
+EVENT_PRICE_XOF = int(os.getenv("EVENT_PRICE_XOF", "3000"))
+EVENT_CURRENCY = os.getenv("EVENT_CURRENCY", "XOF").upper()
+
+def _verify_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    """
+    Vérifie la signature HMAC-SHA256.
+    Par défaut on attend un header 'FedaPay-Signature' contenant l'hex du HMAC.
+    Si ton dashboard/documentation donne un autre nom/format, adapte ici.
+    """
+    if not secret:
+        # Si pas de secret défini, on accepte (utile pour tester vite fait) — à éviter en prod
+        return True
+    if not signature_header:
+        return False
+    digest = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, signature_header)
+
+@app.post("/webhook/fedapay")
+def webhook_fedapay():
+    """
+    Webhook minimal :
+    - Vérifie (si présent) la signature HMAC dans 'FedaPay-Signature'
+    - Lit le JSON
+    - Si statut payé + montant/devise corrects => (ex) log / générer QR / marquer payé
+    NB: le webhook n'affiche rien à l'utilisateur; il doit répondre vite (200 OK).
+    """
+    raw = request.get_data()
+    signature = request.headers.get("FedaPay-Signature", "")
+
+    # 1) Signature
+    if not _verify_signature(raw, signature, FEDAPAY_WEBHOOK_SECRET):
+        abort(401, "Signature invalide")
+
+    # 2) JSON
+    payload = request.get_json(silent=True) or {}
+    event = (payload.get("event") or "").lower()
+    data = payload.get("data") or {}
+    tx = data.get("object") or {}
+    status = (tx.get("status") or "").lower()
+    amount = int(tx.get("amount") or 0)
+
+    # Devise peut être "XOF" ou un objet { iso:"XOF", ... }
+    cur = tx.get("currency")
+    if isinstance(cur, dict):
+        currency = (cur.get("iso") or cur.get("code") or "").upper()
+    else:
+        currency = (cur or "").upper()
+
+    app.logger.info(f"[Webhook] event={event} status={status} amount={amount} {currency}")
+
+    # 3) Règle de validation minimaliste
+    if status in {"approved", "paid", "success", "completed"} and amount == EVENT_PRICE_XOF and currency in {"XOF", "CFA", "FCFA"}:
+        # Ici tu peux :
+        # - Générer le QR (si tu connais le nom/prénom côté serveur)
+        # - Ou marquer la transaction 'payée' en base
+        # - Ou déclencher un email/SMS, etc.
+        app.logger.info("[Webhook] ✅ Paiement validé — action de confirmation ici")
+
+    # Toujours répondre 200 rapidement
+    return jsonify({"ok": True})
+
+
 if __name__ == "__main__":
     print("==> QR Provider sur http://127.0.0.1:5000 (Ctrl+C pour arrêter)")
     app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
