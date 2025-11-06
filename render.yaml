@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: mini-notes-flask
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app:app"
+    healthCheckPath: /health
+    autoDeploy: true
