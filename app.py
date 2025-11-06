@@ -168,7 +168,7 @@ import os, hmac, hashlib, json
 from flask import request, jsonify, abort
 
 # Variables d'env (à créer sur Render)
-FEDAPAY_WEBHOOK_SECRET = os.getenv("FEDAPAY_WEBHOOK_SECRET", "")  # chaîne hex ou texte partagé
+FEDAPAY_WEBHOOK_SECRET = os.getenv("FEDAPAY_WEBHOOK_SECRET", "wh_live_2rC8SS0fshX26r4Ejz3hhvC9")  # chaîne hex ou texte partagé
 EVENT_PRICE_XOF = int(os.getenv("EVENT_PRICE_XOF", "3000"))
 EVENT_CURRENCY = os.getenv("EVENT_CURRENCY", "XOF").upper()
 
