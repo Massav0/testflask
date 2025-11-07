@@ -159,7 +159,8 @@ def index():
 def pay_intent():
     """
     FRONT → BACK
-    Le front poste {nom, prenom, email?}. Le back crée la transaction FedaPay et renvoie {pay_url, tx_ref?}.
+    Le front poste {nom, prenom, email?}. Le back crée la transaction FedaPay,
+    puis génère le lien de paiement (token) et renvoie {pay_url, tx_ref}.
     """
     body = request.get_json(silent=True) or {}
     nom = (body.get("nom") or "").strip()
@@ -169,81 +170,68 @@ def pay_intent():
     if not nom or not prenom:
         abort(400, "Champs 'nom' et 'prenom' requis")
 
-    # Préparer la création de transaction côté FedaPay
-    # NOTE: la structure exacte peut varier selon l'API/SDK utilisé.
-    # On prévoit les champs usuels: amount, currency, description, callback_url, metadata.
-    payload = {
+    # 1) Création de la transaction
+    payload_tx = {
         "description": f"Billet {nom} {prenom}",
         "amount": EVENT_PRICE_XOF,
         "currency": EVENT_CURRENCY,
         "callback_url": CALLBACK_URL,
-        "metadata": {
-            "nom": nom,
-            "prenom": prenom,
-            "email": email,
-        }
+        "metadata": {"nom": nom, "prenom": prenom, "email": email}
     }
 
-    # Auth basique: clé secrète en Basic-Auth (username = key, password = "")
-    # Tu peux aussi utiliser Authorization: Bearer <key> si ton intégration le demande.
-    headers = {"Content-Type": "application/json"}
-    auth = (FEDAPAY_SECRET_KEY, "")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {FEDAPAY_SECRET_KEY}",  # ← Bearer obligatoire
+    }
 
     try:
-        r = requests.post(f"{FEDAPAY_API_BASE}/transactions", json=payload, headers=headers, auth=auth, timeout=15)
+        r = requests.post(f"{FEDAPAY_API_BASE}/transactions",
+                          json=payload_tx, headers=headers, timeout=20)
         r.raise_for_status()
         data = r.json() or {}
     except Exception as e:
         app.logger.exception("Erreur création transaction FedaPay")
-        abort(502, f"Erreur FedaPay: {e}")
+        abort(502, f"Erreur FedaPay (create tx): {e}")
 
-    # Extraire l'URL de paiement et un identifiant
-    # (Selon la réponse, l'URL peut s'appeler link/url/checkout_url; on tente plusieurs possibilités)
-    pay_url = (
-        data.get("data", {}).get("link")
-        or data.get("data", {}).get("url")
-        or data.get("data", {}).get("checkout_url")
-        or data.get("link")
-        or data.get("url")
-    )
-    # Possible identifiant de transaction (txid) renvoyé à la création
+    # id de transaction (txid)
     txid = (
-        str(data.get("data", {}).get("id") or "")
-        or str(data.get("id") or "")
+        str(data.get("data", {}).get("id") or data.get("id") or "")
+        .strip()
     )
+    if not txid:
+        abort(502, "Transaction créée sans identifiant (id)")
 
+    # 2) Génération du token + lien de paiement pour cette transaction
+    try:
+        r2 = requests.post(f"{FEDAPAY_API_BASE}/transactions/{txid}/token",
+                           headers=headers, timeout=20)
+        r2.raise_for_status()
+        tok = r2.json() or {}
+    except Exception as e:
+        app.logger.exception("Erreur génération token/lien FedaPay")
+        abort(502, f"Erreur FedaPay (token): {e}")
+
+    # Selon la version, le lien peut être dans 'url', 'link' ou 'payment_url'
+    pay_url = (
+        tok.get("data", {}).get("url")
+        or tok.get("data", {}).get("link")
+        or tok.get("url")
+        or tok.get("link")
+    )
     if not pay_url:
-        abort(502, "Réponse FedaPay sans lien de paiement")
+        abort(502, "Réponse FedaPay sans lien de paiement (token)")
 
-    # Optionnel: initialiser en mémoire si txid connu dès maintenant
-    if txid:
-        TX_STORE[txid] = {
-            "status": "pending",
-            "amount": EVENT_PRICE_XOF,
-            "currency": EVENT_CURRENCY,
-            "nom": nom,
-            "prenom": prenom,
-            "email": email,
-        }
+    # Init en “DB” mémoire
+    TX_STORE[txid] = {
+        "status": "pending",
+        "amount": EVENT_PRICE_XOF,
+        "currency": EVENT_CURRENCY,
+        "nom": nom,
+        "prenom": prenom,
+        "email": email,
+    }
 
-    # Le front redirigera vers pay_url
-    return jsonify({"pay_url": pay_url, "tx_ref": txid or None})
-
-# Vérification signature webhook (HMAC SHA-256 du body avec secret)
-def _verify_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
-    if not secret or not signature_header:
-        return False
-    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
-
-def _extract_currency(tx_currency) -> str:
-    if isinstance(tx_currency, dict):
-        return (tx_currency.get("iso") or tx_currency.get("code") or "").upper()
-    return (tx_currency or "").upper()
-
-def _extract_txid(tx_obj: dict) -> str:
-    # Essaye divers champs possibles
-    return str(tx_obj.get("id") or tx_obj.get("reference") or tx_obj.get("transaction_id") or "").strip()
+    return jsonify({"pay_url": pay_url, "tx_ref": txid})
 
 @app.post("/webhook/fedapay")
 def webhook_fedapay():
