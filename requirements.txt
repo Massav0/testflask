@@ -1,6 +1,16 @@
-Flask==3.0.3
-flask-cors==4.0.0
-qrcode==7.4.2
-Pillow==10.4.0
-gunicorn==22.0.0
-python-dotenv
+# --- Core web framework ---
+Flask>=3.0,<4.0
+Flask-Cors>=4.0,<5.0
+
+# --- HTTP client (appel API FedaPay) ---
+requests>=2.31,<3.0
+
+# --- QR code (PNG + SVG) ---
+# L'extra [pil] installe Pillow pour le rendu PNG
+qrcode[pil]>=7.4,<8.0
+
+# --- Serveur de prod (ex: sur Linux/containers) ---
+gunicorn>=21.2,<22.0
+
+# --- Facultatif / dev (décommente si tu en as besoin) ---
+# python-dotenv>=1.0,<2.0     # pour charger un .env en local
