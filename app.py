@@ -18,8 +18,8 @@ app = Flask(__name__)
 
 # ───────────────────────── Config / ENV ─────────────────────────
 # ENV: "live" | "sandbox"
-FEDAPAY_ENV = os.getenv("FEDAPAY_ENV", "sandbox").strip().lower()
-EVENT_PRICE_XOF = int(os.getenv("EVENT_PRICE_XOF", "3000"))
+FEDAPAY_ENV = os.getenv("FEDAPAY_ENV", "live").strip().lower()
+EVENT_PRICE_XOF = int(os.getenv("EVENT_PRICE_XOF", "100"))
 EVENT_CURRENCY = os.getenv("EVENT_CURRENCY", "XOF").upper()
 
 # Clé d'API FedaPay (SECRÈTE) pour créer les transactions côté serveur
@@ -34,7 +34,7 @@ QR_SIGNING_KEY = os.getenv("QR_SIGNING_KEY", "change-me-signing-key").encode()
 # API base selon env
 FEDAPAY_API_BASE = os.getenv(
     "FEDAPAY_API_BASE",
-    "https://sandbox-api.fedapay.com/v1" if FEDAPAY_ENV == "sandbox" else "https://api.fedapay.com/v1"
+    ""https://api.fedapay.com/v1"
 ).rstrip("/")
 
 # URL de retour (front) après paiement — configure ton domaine ici
