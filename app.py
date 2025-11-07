@@ -156,6 +156,21 @@ def index():
 
 # ───────────────────────── Endpoints “timeline” ─────────────────────────
 
+
+# ───────────────────────── Webhook utils (signature HMAC) ─────────────────────────
+def _verify_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    """
+    Vérifie la signature HMAC-SHA256 envoyée par FedaPay.
+    - raw_body: corps brut de la requête (bytes)
+    - signature_header: header 'X-FEDAPAY-SIGNATURE' (hex)
+    - secret: FEDAPAY_WEBHOOK_SECRET
+    """
+    if not secret or not signature_header:
+        return False
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header.strip())
+
+
 @app.post("/webhook/fedapay")
 def webhook_fedapay():
     """
