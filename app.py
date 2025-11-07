@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 import requests
-from flask import Flask, request, send_file, jsonify, render_template_string, abort, redirect
+from flask import Flask, request, send_file, jsonify, render_template_string, abort
 from flask_cors import CORS
 
 import qrcode
@@ -22,7 +22,7 @@ FEDAPAY_ENV = os.getenv("FEDAPAY_ENV", "live").strip().lower()
 EVENT_PRICE_XOF = int(os.getenv("EVENT_PRICE_XOF", "100"))
 EVENT_CURRENCY = os.getenv("EVENT_CURRENCY", "XOF").upper()
 
-# Clé d'API FedaPay (SECRÈTE) pour créer les transactions côté serveur
+# Clé d'API FedaPay (SECRÈTE) — pas indispensable si tu utilises une page créée manuellement
 FEDAPAY_SECRET_KEY = os.getenv("FEDAPAY_SECRET_KEY", "").strip()
 
 # Webhook secret (fourni dans Dashboard > Webhooks)
@@ -31,22 +31,22 @@ FEDAPAY_WEBHOOK_SECRET = os.getenv("FEDAPAY_WEBHOOK_SECRET", "wh_live_FroCduCVd9
 # Clé de signature des QR (obligatoire en prod)
 QR_SIGNING_KEY = os.getenv("QR_SIGNING_KEY", "change-me-signing-key").encode()
 
-# API base selon env
+# API base selon env (utile si tu réactives la création serveur)
 FEDAPAY_API_BASE = os.getenv(
     "FEDAPAY_API_BASE",
     "https://api.fedapay.com/v1"
 ).rstrip("/")
 
-# URL de retour (front) après paiement — configure ton domaine ici
+# URL de retour (front) après paiement — configure ton domaine ici (ex: https://ton-front.com/retour.html)
 CALLBACK_URL = os.getenv("CALLBACK_URL", "https://ton-front.com/retour")
 
 # Autoriser CORS pour les endpoints API (utile si front statique sur un autre domaine)
-CORS(app, resources={r"/api/*": {"origins": "*"}, r"/pay-intent": {"origins": "*"}})
+# (On évite de l'appliquer au webhook.)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ───────────────────────── “Mini-DB” en mémoire (exemple) ─────────────────────────
 # Remplace par une vraie base (SQL/NoSQL). Clé = txid (id transaction FedaPay).
 TX_STORE: Dict[str, Dict[str, Any]] = {}
-# Valeurs typiques :
 # {
 #   txid: {
 #       "status": "pending"|"paid"|"failed",
@@ -135,16 +135,8 @@ INDEX = """
 <body>
 <main>
   <h1>Démo timeline : Front → Back → FedaPay → Webhook → QR</h1>
-  <p>1) Renseigne tes infos et clique <strong>Payer</strong>. Le back crée une transaction FedaPay et te renvoie <code>pay_url</code> (ici on redirige).</p>
-  <form id="f">
-    <input name="nom" placeholder="Nom" required>
-    <input name="prenom" placeholder="Prénom" required>
-    <input name="email" placeholder="Email (pour envoi)">
-    <button type="submit">Payer</button>
-  </form>
+  <p>Configure seulement ton webhook FedaPay et la page de retour front. Ce backend génère le QR dès réception du webhook.</p>
   <p class="mono">CALLBACK_URL (retour après paiement) : {{cb}}</p>
-  <hr>
-  <p><em>Après le paiement</em>, FedaPay redirige vers <code>CALLBACK_URL?id=...&status=...</code> (front) et envoie aussi le <strong>webhook</strong> au back. La page de retour appelle <code>/api/tx-status?id=...</code> jusqu’à ce que le back dise <code>paid</code> et retourne le QR.</p>
 </main>
 </body>
 </html>
@@ -154,35 +146,78 @@ INDEX = """
 def index():
     return render_template_string(INDEX, cb=CALLBACK_URL)
 
-# ───────────────────────── Endpoints “timeline” ─────────────────────────
+# ───────────────────────── Helpers de parsing ─────────────────────────
+def _extract_currency(tx_currency) -> str:
+    if isinstance(tx_currency, dict):
+        return (tx_currency.get("iso") or tx_currency.get("code") or "").upper()
+    return (tx_currency or "").upper()
 
+def _extract_txid(tx_obj: dict) -> str:
+    # Essaye divers champs possibles pour la robustesse
+    return str(
+        tx_obj.get("id") or
+        tx_obj.get("reference") or
+        tx_obj.get("transaction_id") or
+        ""
+    ).strip()
 
 # ───────────────────────── Webhook utils (signature HMAC) ─────────────────────────
+def _parse_sig_header(sig_header: str):
+    """
+    Supporte un header brut ou structuré (ex: 't=...,v1=...').
+    Retourne (timestamp|None, signature|None)
+    """
+    if not sig_header:
+        return None, None
+    h = sig_header.strip()
+    if "=" not in h:
+        return None, h  # valeur brute
+    parts = {}
+    for chunk in h.split(","):
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            parts[k.strip()] = v.strip()
+    return parts.get("t"), parts.get("v1") or parts.get("signature") or parts.get("sig")
+
 def _verify_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
     """
     Vérifie la signature HMAC-SHA256 envoyée par FedaPay.
-    - raw_body: corps brut de la requête (bytes)
-    - signature_header: header 'X-FEDAPAY-SIGNATURE' (hex)
-    - secret: FEDAPAY_WEBHOOK_SECRET
+    - calcule HMAC sur le CORPS BRUT (raw_body)
+    - accepte comparaison en HEX ou Base64
+    - accepte header brut ou structuré (t=..., v1=...)
     """
     if not secret or not signature_header:
         return False
-    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header.strip())
 
+    ts, provided = _parse_sig_header(signature_header)
+    if not provided:
+        return False
 
+    mac = hmac.new(secret.encode(), raw_body, hashlib.sha256).digest()
+    expected_hex = mac.hex()
+    expected_b64 = base64.b64encode(mac).decode().strip()
+
+    provided_clean = provided.strip().strip('"').strip("'")
+    return (
+        hmac.compare_digest(provided_clean, expected_hex) or
+        hmac.compare_digest(provided_clean, expected_b64)
+    )
+
+# ───────────────────────── Webhook FedaPay ─────────────────────────
 @app.post("/webhook/fedapay")
 def webhook_fedapay():
     """
     FedaPay → BACK
     Source de vérité. Si transaction approved & montant/devise OK → génère le QR (avec txid signé) et range en DB.
     """
-    raw = request.get_data()
+    raw = request.get_data(cache=False)  # corps BRUT
     signature = request.headers.get("X-FEDAPAY-SIGNATURE", "")
 
     if not _verify_signature(raw, signature, FEDAPAY_WEBHOOK_SECRET):
-        abort(401, "Signature invalide")
+        app.logger.warning(f"[Webhook] ❌ signature invalide recv='{(signature or '')[:24]}...'")
+        return jsonify({"ok": False, "error": "invalid_signature"}), 401
 
+    # 2) Payload JSON
     payload = request.get_json(silent=True) or {}
     event = (payload.get("event") or "").lower()
     data = payload.get("data") or {}
@@ -195,12 +230,12 @@ def webhook_fedapay():
     txid = _extract_txid(tx)
     customer = tx.get("customer") or {}
     prenom = (customer.get("first_name") or "").strip() or (tx.get("metadata", {}) or {}).get("prenom") or "Inconnu"
-    nom = (customer.get("last_name") or "").strip() or (tx.get("metadata", {}) or {}).get("nom") or "Inconnu"
-    email = (tx.get("metadata", {}) or {}).get("email") or ""
+    nom    = (customer.get("last_name")  or "").strip() or (tx.get("metadata", {}) or {}).get("nom")    or "Inconnu"
+    email  = (tx.get("metadata", {}) or {}).get("email") or ""
 
     app.logger.info(f"[Webhook] event={event} status={status} amount={amount} {currency} txid={txid} {nom} {prenom}")
 
-    paid_ok = status in {"approved", "paid", "success", "completed"}
+    paid_ok  = status in {"approved", "paid", "success", "completed"}
     money_ok = (amount == EVENT_PRICE_XOF and currency in {"XOF", "CFA", "FCFA"})
 
     # Initialise/complète la fiche en mémoire
@@ -210,8 +245,11 @@ def webhook_fedapay():
         "currency": currency,
         "nom": nom, "prenom": prenom, "email": email
     })
-    # Mets à jour les infos utiles (au cas où)
-    rec.update({"amount": amount or rec.get("amount"), "currency": currency or rec.get("currency"), "nom": nom, "prenom": prenom, "email": email})
+    rec.update({
+        "amount": amount or rec.get("amount"),
+        "currency": currency or rec.get("currency"),
+        "nom": nom, "prenom": prenom, "email": email
+    })
 
     if event == "transaction.approved" and paid_ok and money_ok and txid:
         # Construire le QR avec txid signé
@@ -233,8 +271,10 @@ def webhook_fedapay():
     else:
         app.logger.info("[Webhook] ⚠️ Conditions non réunies pour émission du QR")
 
+    # Répond 200 rapidement pour éviter les replays
     return jsonify({"ok": True})
 
+# ───────────────────────── API de polling (page retour) ─────────────────────────
 @app.get("/api/tx-status")
 def api_tx_status():
     """
@@ -264,6 +304,7 @@ def api_tx_status():
 
     return jsonify({"status": rec.get("status", "pending")})
 
+# ───────────────────────── Vérification de QR (contrôle d'accès) ─────────────────────────
 @app.post("/api/verify")
 def api_verify():
     """
