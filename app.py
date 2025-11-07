@@ -34,7 +34,7 @@ QR_SIGNING_KEY = os.getenv("QR_SIGNING_KEY", "change-me-signing-key").encode()
 # API base selon env
 FEDAPAY_API_BASE = os.getenv(
     "FEDAPAY_API_BASE",
-    ""https://api.fedapay.com/v1"
+    "https://api.fedapay.com/v1"
 ).rstrip("/")
 
 # URL de retour (front) après paiement — configure ton domaine ici
